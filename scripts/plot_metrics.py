@@ -13,6 +13,31 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib import font_manager
+
+
+KOREAN_FONT_CANDIDATES = (
+    "Noto Sans CJK KR",
+    "Noto Sans KR",
+    "NanumGothic",
+    "NanumBarunGothic",
+    "Malgun Gothic",
+    "AppleGothic",
+    "UnDotum",
+    "Baekmuk Gulim",
+)
+
+
+def configure_matplotlib_fonts() -> str | None:
+    available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+    for font_name in KOREAN_FONT_CANDIDATES:
+        if font_name in available_fonts:
+            plt.rcParams["font.family"] = [font_name, "DejaVu Sans", "sans-serif"]
+            plt.rcParams["axes.unicode_minus"] = False
+            return font_name
+    plt.rcParams["font.family"] = ["DejaVu Sans", "sans-serif"]
+    plt.rcParams["axes.unicode_minus"] = False
+    return None
 
 
 def read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -263,7 +288,6 @@ def draw_plot(
         ha="left",
         va="top",
         fontsize=10,
-        family="monospace",
         bbox={"facecolor": "#eef2f8", "edgecolor": "#d7deea", "boxstyle": "round,pad=0.5"},
     )
 
@@ -400,6 +424,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_argparser().parse_args()
+    selected_font = configure_matplotlib_fonts()
     metrics_path = args.metrics
     debug_path = args.debug_log or metrics_path.parent / "training.debug.jsonl"
     output_path = args.output or metrics_path.with_suffix(".png")
@@ -410,6 +435,10 @@ def main() -> None:
     print(f"saved plot: {output_path}")
     print(f"metrics input: {metrics_path}")
     print(f"debug input: {debug_path}")
+    if selected_font is not None:
+        print(f"font: {selected_font}")
+    else:
+        print("font: no Korean-capable font found; install Noto Sans CJK KR, NanumGothic, or Malgun Gothic")
     for line in summary_lines:
         print(f"- {line}")
 
