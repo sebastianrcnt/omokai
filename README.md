@@ -31,11 +31,16 @@
 
 - 가변 보드 크기 오목 환경
 - 배치 self-play MCTS
+- `virtual loss` 기반 leaves-per-batch MCTS로 단일 게임에서도 GPU 추론 배치를 키움
+- `discounted value target` — 빨리 이긴 게임이 늦게 이긴 게임보다 강한 신호를 가지도록 γ^remaining 감가
+- `recency-weighted replay` — 오래된 self-play 샘플 비중을 줄여 정책 업데이트가 과거 분포에 끌려가지 않도록 함
+- 정책/가치 손실 가중치 및 선형 temperature decay 설정
 - 정책/가치 헤드가 달린 SE-ResNet
 - `best` 대 `candidate` arena 승급 평가
 - 중단/재개 가능한 trainer state 저장
 - 체크포인트 저장 및 로드
-- Pygame GUI로 체크포인트와 직접 대국
+- Pygame GUI로 체크포인트와 직접 대국 (학습 중에도 최신 체크포인트 리로드 가능)
+- 오프닝 시드 선택으로 다양한 시작 국면 재현
 - ROCm/WSL 설치 가이드 및 자동 점검 스크립트
 
 ## 설치
@@ -83,10 +88,15 @@ python3 -m omokai.gui --checkpoint checkpoints/rocm_unlimited/best.pt
 ## GUI 조작
 
 - 좌클릭: 착수
-- `R`: 재시작
+- `R`: 현재 시드로 재시작
 - `S`: 흑/백 전환
 - `N` / `P`: 체크포인트 디렉터리 내 다음/이전 모델 로드
+- `L`: 체크포인트 디렉터리 재스캔 (학습 중 새로 저장된 체크포인트 반영)
 - `M`: AI 즉시 한 수 두기
+- `O`: 현재 시드로 오프닝 자동 배치
+- `[` / `]`: 오프닝 시드 감소/증가
+
+학습 중에도 `--checkpoint checkpoints/rocm_unlimited` 로 GUI를 실행하면 `L` 키로 최신 iter/latest/best 체크포인트를 즉시 불러와 대국할 수 있다.
 
 ## AMD GPU 메모
 

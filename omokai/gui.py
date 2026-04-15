@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import random
 from pathlib import Path
 
 import pygame
@@ -9,23 +10,36 @@ from .board import GameState
 from .checkpoint import list_checkpoints, load_checkpoint
 from .config import load_config
 from .device import resolve_device
+from .evaluator import ModelEvaluator
 from .mcts import MCTS
 from .network import PolicyValueNet
+from .openings import sample_balanced_openings
 
 
 class OmokGUI:
-    def __init__(self, checkpoint: str | None, config_path: str, device_name: str, simulations: int) -> None:
+    def __init__(
+        self,
+        checkpoint: str | None,
+        config_path: str,
+        device_name: str,
+        simulations: int,
+        human_color: int = -1,
+        seed: int = 0,
+    ) -> None:
         self.device = resolve_device(device_name)
         self.simulations = simulations
+        self.checkpoint_source = checkpoint
         self.checkpoints = self._discover_checkpoints(checkpoint)
-        self.checkpoint_index = 0
+        self.checkpoint_index = len(self.checkpoints) - 1 if self.checkpoints else 0
         self.config = load_config(config_path)
         self.model = PolicyValueNet(self.config.rules.board_size, self.config.network).to(self.device)
         self.metadata: dict[str, object] = {}
         if self.checkpoints:
-            self._load_checkpoint(self.checkpoints[0])
+            self._load_checkpoint(self.checkpoints[self.checkpoint_index])
         self.state = GameState(self.config.rules.board_size, self.config.rules.exactly_five)
-        self.human_color = -1
+        self.human_color = 1 if int(human_color) >= 1 else -1
+        self.seed = int(seed)
+        self.current_opening: list[int] = []
 
         pygame.init()
         pygame.display.set_caption("OmokAI GUI")
@@ -51,7 +65,11 @@ class OmokGUI:
         return []
 
     def _load_checkpoint(self, path: Path) -> None:
-        model, config, metadata = load_checkpoint(path, device="cpu")
+        try:
+            model, config, metadata = load_checkpoint(path, device="cpu")
+        except Exception as exc:
+            print(f"[gui] failed to load {path}: {exc}")
+            return
         self.config = config
         self.model = model.to(self.device)
         self.model.eval()
@@ -59,6 +77,38 @@ class OmokGUI:
         if path in self.checkpoints:
             self.checkpoint_index = self.checkpoints.index(path)
         self.state = GameState(self.config.rules.board_size, self.config.rules.exactly_five)
+        self.current_opening = []
+
+    def _refresh_checkpoints(self) -> None:
+        previous = self.checkpoints[self.checkpoint_index] if self.checkpoints else None
+        self.checkpoints = self._discover_checkpoints(self.checkpoint_source)
+        if not self.checkpoints:
+            self.checkpoint_index = 0
+            return
+        if previous and previous in self.checkpoints:
+            self.checkpoint_index = self.checkpoints.index(previous)
+        else:
+            self.checkpoint_index = len(self.checkpoints) - 1
+        self._load_checkpoint(self.checkpoints[self.checkpoint_index])
+
+    def _reset_state(self, apply_opening: bool) -> None:
+        self.state = GameState(self.config.rules.board_size, self.config.rules.exactly_five)
+        self.current_opening = []
+        if not apply_opening:
+            return
+        rng = random.Random(self.seed)
+        openings = sample_balanced_openings(self.config.rules.board_size, 32, rng)
+        if not openings:
+            return
+        opening = openings[0]
+        for action in opening:
+            if self.state.terminal:
+                break
+            legal = self.state.legal_moves()
+            if not legal[action]:
+                break
+            self.state.apply_action(action)
+            self.current_opening.append(action)
 
     def run(self) -> None:
         running = True
@@ -83,10 +133,10 @@ class OmokGUI:
         if key == pygame.K_ESCAPE:
             return False
         if key == pygame.K_r:
-            self.state = GameState(self.config.rules.board_size, self.config.rules.exactly_five)
+            self._reset_state(apply_opening=bool(self.current_opening))
         elif key == pygame.K_s:
             self.human_color *= -1
-            self.state = GameState(self.config.rules.board_size, self.config.rules.exactly_five)
+            self._reset_state(apply_opening=False)
         elif key == pygame.K_m and not self.state.terminal:
             self._ai_move()
         elif key == pygame.K_n and self.checkpoints:
@@ -95,6 +145,14 @@ class OmokGUI:
         elif key == pygame.K_p and self.checkpoints:
             self.checkpoint_index = (self.checkpoint_index - 1) % len(self.checkpoints)
             self._load_checkpoint(self.checkpoints[self.checkpoint_index])
+        elif key == pygame.K_l:
+            self._refresh_checkpoints()
+        elif key == pygame.K_o:
+            self._reset_state(apply_opening=True)
+        elif key == pygame.K_LEFTBRACKET:
+            self.seed = max(0, self.seed - 1)
+        elif key == pygame.K_RIGHTBRACKET:
+            self.seed += 1
         return True
 
     def _handle_click(self, pos: tuple[int, int]) -> None:
@@ -106,15 +164,21 @@ class OmokGUI:
         self.state.apply_action(action)
 
     def _ai_move(self) -> None:
+        evaluator = ModelEvaluator(model=self.model, device=self.device, use_amp=self.config.use_amp)
         search = MCTS(
-            model=self.model,
-            device=self.device,
             c_puct=self.config.selfplay.c_puct,
             dirichlet_alpha=self.config.selfplay.dirichlet_alpha,
             dirichlet_epsilon=0.0,
-            use_amp=self.config.use_amp,
+            evaluator=evaluator,
         )
-        result = search.search_batch([self.state], self.simulations, [0.0], add_noise=False)[0]
+        result = search.search_batch(
+            [self.state],
+            self.simulations,
+            [0.0],
+            add_noise=False,
+            leaves_per_batch=self.config.selfplay.leaves_per_batch,
+            virtual_loss=self.config.selfplay.virtual_loss,
+        )[0]
         self.state.apply_action(result.action)
 
     def _render(self) -> None:
@@ -175,11 +239,17 @@ class OmokGUI:
         lines.extend(
             [
                 "",
+                f"Seed: {self.seed}",
+                f"Opening: {len(self.current_opening)} plies" if self.current_opening else "Opening: none",
+                "",
                 "Controls",
                 "LMB: move",
-                "R: reset",
+                "R: reset (keep opening)",
+                "O: apply opening w/ seed",
+                "[ / ]: seed -/+",
                 "S: swap side",
                 "N/P: next/prev ckpt",
+                "L: reload ckpt list",
                 "M: force AI move",
                 "Esc: quit",
             ]
@@ -219,12 +289,22 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=str, default="configs/rocm_24h.yaml")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--simulations", type=int, default=96)
+    parser.add_argument("--human-color", type=str, default="white", choices=["black", "white"])
+    parser.add_argument("--seed", type=int, default=0)
     return parser
 
 
 def main() -> None:
     args = build_argparser().parse_args()
-    app = OmokGUI(args.checkpoint, args.config, args.device, args.simulations)
+    human_color = 1 if args.human_color == "black" else -1
+    app = OmokGUI(
+        checkpoint=args.checkpoint,
+        config_path=args.config,
+        device_name=args.device,
+        simulations=args.simulations,
+        human_color=human_color,
+        seed=args.seed,
+    )
     app.run()
 
 
