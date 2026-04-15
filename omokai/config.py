@@ -30,9 +30,12 @@ class SelfPlayConfig:
     inference_batch_size: int = 256
     inference_wait_ms: float = 1.0
     temperature_moves: int = 12
+    temperature_end: float = 0.0
     dirichlet_alpha: float = 0.20
     dirichlet_epsilon: float = 0.25
     c_puct: float = 1.6
+    virtual_loss: float = 0.0
+    leaves_per_batch: int = 1
     simulation_ramp_iterations: int | None = None
     candidate_mix_fraction: float = 0.0
     mixed_iterations_after_promotion: int = 0
@@ -55,6 +58,10 @@ class OptimizationConfig:
     grad_clip: float = 1.0
     replay_capacity: int = 120_000
     warmup_games: int = 48
+    policy_loss_weight: float = 1.0
+    value_loss_weight: float = 1.0
+    value_discount: float = 1.0
+    recency_temperature: float = 0.0
 
 
 @dataclass(slots=True)

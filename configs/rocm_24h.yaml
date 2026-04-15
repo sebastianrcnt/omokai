@@ -16,14 +16,17 @@ network:
 
 selfplay:
   games_per_iteration: 64
-  batch_size: 48
+  batch_size: 64
   search_threads: 4
-  inference_batch_size: 384
-  inference_wait_ms: 1.5
-  temperature_moves: 8
-  dirichlet_alpha: 0.20
+  inference_batch_size: 512
+  inference_wait_ms: 2.0
+  temperature_moves: 10
+  temperature_end: 0.1
+  dirichlet_alpha: 0.30
   dirichlet_epsilon: 0.25
   c_puct: 1.6
+  virtual_loss: 1.0
+  leaves_per_batch: 8
   candidate_mix_fraction: 0.5
   mixed_iterations_after_promotion: 8
   simulation_schedule:
@@ -43,13 +46,17 @@ optimization:
   grad_clip: 1.0
   replay_capacity: 80000
   warmup_games: 128
+  policy_loss_weight: 1.0
+  value_loss_weight: 1.5
+  value_discount: 0.98
+  recency_temperature: 3.0e-5
 
 arena:
-  games: 24
+  games: 48
   simulations: 192
   accept_win_rate: 0.55
   min_white_win_rate: 0.1667
-  bootstrap_games: 12
+  bootstrap_games: 24
   bootstrap_simulations: 96
   bootstrap_accept_win_rate: 0.5
   bootstrap_min_white_win_rate: 0.1667

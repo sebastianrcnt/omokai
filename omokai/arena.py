@@ -40,12 +40,16 @@ class Arena:
         search_threads: int = 1,
         inference_batch_size: int = 256,
         inference_wait_ms: float = 1.0,
+        leaves_per_batch: int = 1,
+        virtual_loss: float = 0.0,
     ) -> None:
         self.board_size = board_size
         self.exactly_five = exactly_five
         self.simulations = simulations
         self.c_puct = c_puct
         self.search_threads = max(1, search_threads)
+        self.leaves_per_batch = max(1, int(leaves_per_batch))
+        self.virtual_loss = max(0.0, float(virtual_loss))
         self.candidate_evaluator = self._build_evaluator(
             model=candidate_model,
             device=device,
@@ -159,12 +163,28 @@ class Arena:
         best_root = None
         while not state.terminal:
             if state.to_play == candidate_color:
-                result = candidate_search.search_batch([state], self.simulations, [0.0], add_noise=False, roots=[candidate_root])[0]
+                result = candidate_search.search_batch(
+                    [state],
+                    self.simulations,
+                    [0.0],
+                    add_noise=False,
+                    roots=[candidate_root],
+                    leaves_per_batch=self.leaves_per_batch,
+                    virtual_loss=self.virtual_loss,
+                )[0]
                 candidate_root = result.next_root
                 if best_root is not None:
                     best_root = best_root.children.get(result.action)
             else:
-                result = best_search.search_batch([state], self.simulations, [0.0], add_noise=False, roots=[best_root])[0]
+                result = best_search.search_batch(
+                    [state],
+                    self.simulations,
+                    [0.0],
+                    add_noise=False,
+                    roots=[best_root],
+                    leaves_per_batch=self.leaves_per_batch,
+                    virtual_loss=self.virtual_loss,
+                )[0]
                 best_root = result.next_root
                 if candidate_root is not None:
                     candidate_root = candidate_root.children.get(result.action)

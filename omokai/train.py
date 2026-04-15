@@ -307,13 +307,24 @@ class Trainer:
                 break
         return {"candidate": candidate_workers, "best": best_workers}
 
+    def _selfplay_temperature(self, move_count: int) -> float:
+        cfg = self.config.selfplay
+        end = float(cfg.temperature_end)
+        if cfg.temperature_moves <= 0:
+            return end
+        if move_count >= cfg.temperature_moves:
+            return end
+        frac = move_count / float(cfg.temperature_moves)
+        return 1.0 + (end - 1.0) * frac
+
     def _consume_selfplay_chunk(
         self,
         result: SelfPlayChunkResult,
         counters: dict[str, int | float],
     ) -> None:
+        discount = float(self.config.optimization.value_discount)
         for history, winner in result.completed_games:
-            self.replay.add_game(history, winner)
+            self.replay.add_game(history, winner, value_discount=discount)
         counters["black_wins"] += result.black_wins
         counters["white_wins"] += result.white_wins
         counters["draws"] += result.draws
@@ -364,8 +375,16 @@ class Trainer:
                 roots.append(None)
 
             while states and not self._should_stop():
-                temperatures = [1.0 if state.move_count < self.config.selfplay.temperature_moves else 0.0 for state in states]
-                results = search.search_batch(states, simulations, temperatures, add_noise=True, roots=roots)
+                temperatures = [self._selfplay_temperature(state.move_count) for state in states]
+                results = search.search_batch(
+                    states,
+                    simulations,
+                    temperatures,
+                    add_noise=True,
+                    roots=roots,
+                    leaves_per_batch=self.config.selfplay.leaves_per_batch,
+                    virtual_loss=self.config.selfplay.virtual_loss,
+                )
 
                 next_states: list[GameState] = []
                 next_histories: list[list[PendingSample]] = []
@@ -531,16 +550,23 @@ class Trainer:
         total_value_loss = 0.0
         updates_done = 0
 
+        policy_weight = float(self.config.optimization.policy_loss_weight)
+        value_weight = float(self.config.optimization.value_loss_weight)
+        recency_temperature = float(self.config.optimization.recency_temperature)
         for _ in range(self.config.optimization.updates_per_iteration):
             if self._should_stop():
                 break
-            states, target_policy, target_value = self.replay.sample_batch(self.config.optimization.batch_size, self.device)
+            states, target_policy, target_value = self.replay.sample_batch(
+                self.config.optimization.batch_size,
+                self.device,
+                recency_temperature=recency_temperature,
+            )
             self.optimizer.zero_grad(set_to_none=True)
             with amp_context(self.device, self.config.use_amp):
                 logits, value = model(states)
                 policy_loss = -(target_policy * torch.log_softmax(logits, dim=1)).sum(dim=1).mean()
                 value_loss = F.mse_loss(value, target_value)
-                loss = policy_loss + value_loss
+                loss = policy_weight * policy_loss + value_weight * value_loss
             self.scaler.scale(loss).backward()
             if self.config.optimization.grad_clip > 0:
                 self.scaler.unscale_(self.optimizer)
@@ -607,6 +633,8 @@ class Trainer:
             search_threads=self.config.selfplay.search_threads,
             inference_batch_size=self.config.selfplay.inference_batch_size,
             inference_wait_ms=self.config.selfplay.inference_wait_ms,
+            leaves_per_batch=self.config.selfplay.leaves_per_batch,
+            virtual_loss=self.config.selfplay.virtual_loss,
         )
         result = arena.evaluate(arena_games)
         side_games = max(1, result.games // 2)

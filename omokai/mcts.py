@@ -49,11 +49,15 @@ class MCTS:
         temperature: list[float],
         add_noise: bool,
         roots: list[TreeNode | None] | None = None,
+        leaves_per_batch: int = 1,
+        virtual_loss: float = 0.0,
     ) -> list[SearchResult]:
         if roots is None:
             roots = [None] * len(states)
         if len(roots) != len(states):
             raise ValueError("roots and states must have the same length")
+        leaves_per_batch = max(1, int(leaves_per_batch))
+        vl = max(0.0, float(virtual_loss))
 
         active_roots = [root if root is not None else TreeNode(to_play=state.to_play) for state, root in zip(states, roots, strict=True)]
         init_indices: list[int] = []
@@ -81,7 +85,9 @@ class MCTS:
             if add_noise and not state.terminal:
                 self._apply_root_noise(root)
 
-        for _ in range(num_simulations):
+        sims_done = 0
+        while sims_done < num_simulations:
+            leaves_this_round = min(leaves_per_batch, num_simulations - sims_done)
             pending_states: list[GameState] = []
             pending_nodes: list[TreeNode] = []
             pending_paths: list[list[TreeNode]] = []
@@ -89,20 +95,24 @@ class MCTS:
             for root, root_state in zip(active_roots, states, strict=True):
                 if root_state.terminal:
                     continue
-                state = root_state.clone()
-                node = root
-                path = [node]
-                while node.expanded and node.children and not state.terminal:
-                    action, node = self._select_child(node)
-                    state.apply_action(action)
-                    path.append(node)
-                if state.terminal:
-                    self._backup(path, state.outcome_for_player(state.to_play))
-                    continue
-                pending_states.append(state)
-                pending_nodes.append(node)
-                pending_paths.append(path)
+                for _ in range(leaves_this_round):
+                    state = root_state.clone()
+                    node = root
+                    path = [node]
+                    while node.expanded and node.children and not state.terminal:
+                        action, node = self._select_child(node)
+                        state.apply_action(action)
+                        path.append(node)
+                    if state.terminal:
+                        self._backup(path, state.outcome_for_player(state.to_play))
+                        continue
+                    if vl > 0.0 and leaves_this_round > 1:
+                        self._apply_virtual_loss(path, vl)
+                    pending_states.append(state)
+                    pending_nodes.append(node)
+                    pending_paths.append(path)
 
+            sims_done += leaves_this_round
             if not pending_states:
                 continue
 
@@ -110,6 +120,8 @@ class MCTS:
             for state, node, path, prior, value in zip(
                 pending_states, pending_nodes, pending_paths, batch_priors, batch_values, strict=True
             ):
+                if vl > 0.0 and leaves_this_round > 1:
+                    self._revert_virtual_loss(path, vl)
                 self._expand(node, state, prior)
                 self._backup(path, float(value))
 
@@ -165,6 +177,18 @@ class MCTS:
             node.visit_count += 1
             node.value_sum += value
             value = -value
+
+    def _apply_virtual_loss(self, path: list[TreeNode], strength: float) -> None:
+        for idx, node in enumerate(path):
+            node.visit_count += 1
+            if idx > 0:
+                node.value_sum += strength
+
+    def _revert_virtual_loss(self, path: list[TreeNode], strength: float) -> None:
+        for idx, node in enumerate(path):
+            node.visit_count -= 1
+            if idx > 0:
+                node.value_sum -= strength
 
     def _apply_root_noise(self, root: TreeNode) -> None:
         if not root.children:

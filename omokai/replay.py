@@ -61,27 +61,53 @@ class ReplayBuffer:
     def __len__(self) -> int:
         return len(self.samples)
 
-    def add_game(self, history: Iterable[PendingSample], winner: int) -> None:
-        count = 0
-        for item in history:
-            value = 0.0 if winner == 0 else (1.0 if winner == item.to_play else -1.0)
+    def add_game(
+        self,
+        history: Iterable[PendingSample],
+        winner: int,
+        value_discount: float = 1.0,
+    ) -> None:
+        history_list = list(history)
+        total = len(history_list)
+        if total == 0:
+            return
+        discount = float(np.clip(value_discount, 0.0, 1.0))
+        for idx, item in enumerate(history_list):
+            if winner == 0:
+                value = 0.0
+            else:
+                outcome = 1.0 if winner == item.to_play else -1.0
+                remaining = total - 1 - idx
+                value = outcome * (discount ** remaining)
             self.samples.append(
                 ReplaySample(
                     board=np.asarray(item.board, dtype=np.int8),
                     to_play=int(item.to_play),
                     last_action=item.last_action,
                     policy=np.asarray(item.policy, dtype=np.float32),
-                    value=value,
+                    value=float(value),
                 )
             )
-            count += 1
-        if count:
-            self.games_seen += 1
+        self.games_seen += 1
 
-    def sample_batch(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def sample_batch(
+        self,
+        batch_size: int,
+        device: torch.device,
+        recency_temperature: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if len(self.samples) < batch_size:
             raise ValueError("not enough replay data to sample a batch")
-        indices = np.random.choice(len(self.samples), size=batch_size, replace=False)
+        total = len(self.samples)
+        if recency_temperature > 0.0 and total > 1:
+            positions = np.arange(total, dtype=np.float64)
+            log_weights = recency_temperature * (positions - (total - 1))
+            log_weights -= log_weights.max()
+            weights = np.exp(log_weights)
+            weights /= weights.sum()
+            indices = np.random.choice(total, size=batch_size, replace=False, p=weights)
+        else:
+            indices = np.random.choice(total, size=batch_size, replace=False)
         batch = [self.samples[index] for index in indices]
         boards = np.stack([sample.board for sample in batch], axis=0).astype(np.int8, copy=False)
         to_play = np.fromiter((sample.to_play for sample in batch), dtype=np.int8, count=batch_size)
