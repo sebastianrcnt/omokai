@@ -1,0 +1,48 @@
+experiment_name: quick_cpu
+seed: 7
+max_hours: 0.02
+device: cpu
+use_amp: false
+
+rules:
+  board_size: 9
+  exactly_five: false
+
+network:
+  channels: 64
+  blocks: 4
+  value_hidden: 96
+  se_reduction: 8
+
+selfplay:
+  games_per_iteration: 8
+  batch_size: 4
+  temperature_moves: 6
+  dirichlet_alpha: 0.25
+  dirichlet_epsilon: 0.20
+  c_puct: 1.8
+  simulation_schedule:
+    - fraction: 0.0
+      simulations: 24
+    - fraction: 0.6
+      simulations: 48
+
+optimization:
+  batch_size: 64
+  updates_per_iteration: 24
+  learning_rate: 0.0015
+  weight_decay: 0.0001
+  replay_capacity: 1024
+  warmup_games: 8
+
+arena:
+  games: 6
+  simulations: 32
+  accept_win_rate: 0.55
+  bootstrap_games: 4
+  bootstrap_simulations: 24
+  bootstrap_accept_win_rate: 0.5
+
+checkpoint:
+  directory: checkpoints/quick_cpu
+  save_every_iteration: true

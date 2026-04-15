@@ -1,0 +1,34 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Local virtual environments and env files
+.venv/
+.venv-rocm/
+.env
+.env.*
+
+# Local tooling/runtime artifacts
+.codex
+.rocm-wsl/
+checkpoints/
+logs/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

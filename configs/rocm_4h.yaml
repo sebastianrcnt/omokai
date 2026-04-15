@@ -1,0 +1,56 @@
+experiment_name: rocm_4h
+seed: 23
+max_hours: 4.0
+device: auto
+use_amp: true
+
+rules:
+  board_size: 9
+  exactly_five: false
+
+network:
+  channels: 64
+  blocks: 6
+  value_hidden: 128
+  se_reduction: 8
+
+selfplay:
+  games_per_iteration: 48
+  batch_size: 24
+  temperature_moves: 8
+  dirichlet_alpha: 0.20
+  dirichlet_epsilon: 0.25
+  c_puct: 1.6
+  candidate_mix_fraction: 0.5
+  mixed_iterations_after_promotion: 6
+  simulation_schedule:
+    - fraction: 0.0
+      simulations: 72
+    - fraction: 0.35
+      simulations: 128
+    - fraction: 0.75
+      simulations: 192
+
+optimization:
+  batch_size: 256
+  updates_per_iteration: 72
+  learning_rate: 0.0005
+  min_learning_rate: 0.0005
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  replay_capacity: 50000
+  warmup_games: 96
+
+arena:
+  games: 16
+  simulations: 160
+  accept_win_rate: 0.55
+  min_white_win_rate: 0.125
+  bootstrap_games: 10
+  bootstrap_simulations: 72
+  bootstrap_accept_win_rate: 0.5
+  bootstrap_min_white_win_rate: 0.2
+
+checkpoint:
+  directory: checkpoints/rocm_4h
+  save_every_iteration: true

@@ -1,0 +1,48 @@
+experiment_name: smoke
+seed: 3
+max_hours: 0.001
+device: cpu
+use_amp: false
+
+rules:
+  board_size: 9
+  exactly_five: false
+
+network:
+  channels: 32
+  blocks: 2
+  value_hidden: 64
+  se_reduction: 8
+
+selfplay:
+  games_per_iteration: 2
+  batch_size: 2
+  temperature_moves: 4
+  dirichlet_alpha: 0.25
+  dirichlet_epsilon: 0.15
+  c_puct: 1.5
+  simulation_schedule:
+    - fraction: 0.0
+      simulations: 8
+
+optimization:
+  batch_size: 8
+  updates_per_iteration: 2
+  learning_rate: 0.001
+  min_learning_rate: 0.0001
+  weight_decay: 0.0001
+  grad_clip: 1.0
+  replay_capacity: 256
+  warmup_games: 1
+
+arena:
+  games: 2
+  simulations: 8
+  accept_win_rate: 0.0
+  bootstrap_games: 2
+  bootstrap_simulations: 8
+  bootstrap_accept_win_rate: 0.0
+
+checkpoint:
+  directory: checkpoints/smoke
+  save_every_iteration: true
