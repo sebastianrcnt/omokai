@@ -9,6 +9,7 @@ import torch
 
 from .board import GameState
 from .evaluator import BatchedEvaluator, ModelEvaluator
+from .logging_utils import log_event
 from .mcts import MCTS
 from .network import PolicyValueNet
 from .openings import build_opening_sequences
@@ -44,6 +45,8 @@ class Arena:
         leaves_per_batch: int = 1,
         virtual_loss: float = 0.0,
         logger: logging.Logger | None = None,
+        iteration: int | None = None,
+        phase: str | None = None,
     ) -> None:
         self.board_size = board_size
         self.exactly_five = exactly_five
@@ -53,6 +56,8 @@ class Arena:
         self.leaves_per_batch = max(1, int(leaves_per_batch))
         self.virtual_loss = max(0.0, float(virtual_loss))
         self.logger = logger
+        self.iteration = iteration
+        self.phase = phase
         self.candidate_evaluator = self._build_evaluator(
             model=candidate_model,
             device=device,
@@ -60,6 +65,7 @@ class Arena:
             inference_batch_size=inference_batch_size,
             inference_wait_ms=inference_wait_ms,
             logger=None if logger is None else logger.getChild("candidate_eval"),
+            context="arena_candidate",
         )
         self.best_evaluator = self._build_evaluator(
             model=best_model,
@@ -68,17 +74,28 @@ class Arena:
             inference_batch_size=inference_batch_size,
             inference_wait_ms=inference_wait_ms,
             logger=None if logger is None else logger.getChild("best_eval"),
+            context="arena_best",
         )
         candidate_model.eval()
         best_model.eval()
         if self.logger is not None:
-            self.logger.debug(
+            log_event(
+                self.logger,
+                logging.DEBUG,
+                "arena_initialized",
                 "arena initialized board_size=%d simulations=%d search_threads=%d leaves_per_batch=%d virtual_loss=%.3f",
                 self.board_size,
                 self.simulations,
                 self.search_threads,
                 self.leaves_per_batch,
                 self.virtual_loss,
+                iteration=self.iteration,
+                phase=self.phase,
+                board_size=self.board_size,
+                simulations=self.simulations,
+                search_threads=self.search_threads,
+                leaves_per_batch=self.leaves_per_batch,
+                virtual_loss=self.virtual_loss,
             )
 
     def evaluate(self, games: int) -> ArenaResult:
@@ -91,12 +108,21 @@ class Arena:
         candidate_black_wins = 0
         candidate_white_wins = 0
         if self.logger is not None:
-            self.logger.info(
+            log_event(
+                self.logger,
+                logging.INFO,
+                "arena_evaluation_started",
                 "arena evaluation started games=%d pair_count=%d openings=%d threads=%d",
                 games,
                 pair_count,
                 len(openings),
                 self.search_threads,
+                iteration=self.iteration,
+                phase=self.phase,
+                games=games,
+                pair_count=pair_count,
+                openings=len(openings),
+                threads=self.search_threads,
             )
 
         try:
@@ -124,7 +150,10 @@ class Arena:
             candidate_white_wins=candidate_white_wins,
         )
         if self.logger is not None:
-            self.logger.info(
+            log_event(
+                self.logger,
+                logging.INFO,
+                "arena_evaluation_finished",
                 "arena evaluation finished games=%d candidate_wins=%d best_wins=%d draws=%d candidate_black_wins=%d candidate_white_wins=%d",
                 result.games,
                 result.candidate_wins,
@@ -132,6 +161,15 @@ class Arena:
                 result.draws,
                 result.candidate_black_wins,
                 result.candidate_white_wins,
+                iteration=self.iteration,
+                phase=self.phase,
+                games=result.games,
+                candidate_wins=result.candidate_wins,
+                best_wins=result.best_wins,
+                draws=result.draws,
+                candidate_black_wins=result.candidate_black_wins,
+                candidate_white_wins=result.candidate_white_wins,
+                candidate_win_rate=result.candidate_win_rate,
             )
         return result
 
@@ -143,9 +181,17 @@ class Arena:
         inference_batch_size: int,
         inference_wait_ms: float,
         logger: logging.Logger | None,
+        context: str,
     ) -> ModelEvaluator | BatchedEvaluator:
         if self.search_threads <= 1:
-            return ModelEvaluator(model=model, device=device, use_amp=use_amp, logger=logger)
+            return ModelEvaluator(
+                model=model,
+                device=device,
+                use_amp=use_amp,
+                logger=logger,
+                iteration=self.iteration,
+                context=context,
+            )
         return BatchedEvaluator(
             model=model,
             device=device,
@@ -153,6 +199,8 @@ class Arena:
             max_batch_size=inference_batch_size,
             wait_ms=inference_wait_ms,
             logger=logger,
+            iteration=self.iteration,
+            context=context,
         )
 
     def _play_opening_pair(self, opening: Sequence[int]) -> tuple[int, int, int, int, int]:
@@ -175,7 +223,10 @@ class Arena:
             else:
                 best_wins += 1
         if self.logger is not None:
-            self.logger.debug(
+            log_event(
+                self.logger,
+                logging.DEBUG,
+                "arena_opening_completed",
                 "arena opening completed opening_len=%d candidate_wins=%d best_wins=%d draws=%d black_wins=%d white_wins=%d",
                 len(opening),
                 candidate_wins,
@@ -183,6 +234,14 @@ class Arena:
                 draws,
                 candidate_black_wins,
                 candidate_white_wins,
+                iteration=self.iteration,
+                phase=self.phase,
+                opening_len=len(opening),
+                candidate_wins=candidate_wins,
+                best_wins=best_wins,
+                draws=draws,
+                candidate_black_wins=candidate_black_wins,
+                candidate_white_wins=candidate_white_wins,
             )
         return candidate_wins, best_wins, draws, candidate_black_wins, candidate_white_wins
 

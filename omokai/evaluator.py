@@ -12,6 +12,7 @@ import torch
 from .board import GameState
 from .device import amp_context
 from .features import states_to_feature_planes
+from .logging_utils import log_event
 from .network import PolicyValueNet
 
 
@@ -30,14 +31,31 @@ class ModelEvaluator(Evaluator):
         device: torch.device,
         use_amp: bool,
         logger: logging.Logger | None = None,
+        *,
+        iteration: int | None = None,
+        context: str | None = None,
     ) -> None:
         self.model = model
         self.device = device
         self.use_amp = use_amp
         self.logger = logger
+        self.iteration = iteration
+        self.context = context
         self.model.eval()
         if self.logger is not None:
-            self.logger.debug("initialized model evaluator on device=%s use_amp=%s", self.device, self.use_amp)
+            log_event(
+                self.logger,
+                logging.DEBUG,
+                "evaluator_initialized",
+                "initialized model evaluator on device=%s use_amp=%s context=%s",
+                self.device,
+                self.use_amp,
+                self.context or "-",
+                iteration=self.iteration,
+                context=self.context,
+                device=str(self.device),
+                use_amp=self.use_amp,
+            )
 
     @torch.no_grad()
     def evaluate(self, states: list[GameState]) -> tuple[np.ndarray, np.ndarray]:
@@ -72,9 +90,21 @@ class BatchedEvaluator(Evaluator):
         max_batch_size: int,
         wait_ms: float,
         logger: logging.Logger | None = None,
+        *,
+        iteration: int | None = None,
+        context: str | None = None,
     ) -> None:
         self.logger = logger
-        self.local = ModelEvaluator(model=model, device=device, use_amp=use_amp, logger=logger)
+        self.iteration = iteration
+        self.context = context
+        self.local = ModelEvaluator(
+            model=model,
+            device=device,
+            use_amp=use_amp,
+            logger=logger,
+            iteration=iteration,
+            context=context,
+        )
         self.max_batch_size = max(1, int(max_batch_size))
         self.wait_seconds = max(0.0, float(wait_ms) / 1000.0)
         self.requests: queue.Queue[_EvalRequest | None] = queue.Queue()
@@ -82,10 +112,18 @@ class BatchedEvaluator(Evaluator):
         self.batch_counter = 0
         self.worker.start()
         if self.logger is not None:
-            self.logger.debug(
-                "initialized batched evaluator max_batch_size=%d wait_ms=%.3f",
+            log_event(
+                self.logger,
+                logging.DEBUG,
+                "batched_evaluator_initialized",
+                "initialized batched evaluator max_batch_size=%d wait_ms=%.3f context=%s",
                 self.max_batch_size,
                 wait_ms,
+                self.context or "-",
+                iteration=self.iteration,
+                context=self.context,
+                max_batch_size=self.max_batch_size,
+                wait_ms=wait_ms,
             )
 
     def evaluate(self, states: list[GameState]) -> tuple[np.ndarray, np.ndarray]:
@@ -102,7 +140,16 @@ class BatchedEvaluator(Evaluator):
         self.requests.put(None)
         self.worker.join(timeout=5.0)
         if self.logger is not None:
-            self.logger.debug("closed batched evaluator after %d batches", self.batch_counter)
+            log_event(
+                self.logger,
+                logging.DEBUG,
+                "batched_evaluator_closed",
+                "closed batched evaluator after %d batches",
+                self.batch_counter,
+                iteration=self.iteration,
+                context=self.context,
+                batch_count=self.batch_counter,
+            )
 
     def _run(self) -> None:
         while True:
@@ -136,11 +183,20 @@ class BatchedEvaluator(Evaluator):
                     or self.batch_counter % 16 == 0
                     or features.shape[0] >= max(1, int(self.max_batch_size * 0.75))
                 ):
-                    self.logger.debug(
+                    log_event(
+                        self.logger,
+                        logging.DEBUG,
+                        "batched_inference",
                         "serving batched inference batch_index=%d requests=%d positions=%d",
                         self.batch_counter,
                         len(batch),
                         features.shape[0],
+                        iteration=self.iteration,
+                        context=self.context,
+                        batch_index=self.batch_counter,
+                        requests=len(batch),
+                        positions=int(features.shape[0]),
+                        max_batch_size=self.max_batch_size,
                     )
                 offset = 0
                 for item in batch:
@@ -151,6 +207,14 @@ class BatchedEvaluator(Evaluator):
                     offset += count
             except BaseException as exc:
                 if self.logger is not None:
+                    log_event(
+                        self.logger,
+                        logging.ERROR,
+                        "batched_evaluator_failed",
+                        "batched evaluator request failed",
+                        iteration=self.iteration,
+                        context=self.context,
+                    )
                     self.logger.exception("batched evaluator request failed")
                 for item in batch:
                     item.error = exc

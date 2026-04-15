@@ -9,6 +9,7 @@ description = "Self-play reinforcement learning Omok agent with GUI checkpoint p
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "matplotlib>=3.9",
   "numpy>=1.26,<2.0",
   "PyYAML>=6.0",
   "pygame>=2.6",
@@ -22,4 +23,3 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["omokai*"]
-
