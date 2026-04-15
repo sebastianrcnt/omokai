@@ -7,6 +7,8 @@ from typing import Iterable
 import numpy as np
 import torch
 
+from .features import apply_symmetry_batch, encode_feature_planes_batch
+
 
 @dataclass(slots=True)
 class PendingSample:
@@ -26,14 +28,14 @@ class ReplaySample:
 
 
 def encode_sample(board: np.ndarray, to_play: int, last_action: int | None) -> np.ndarray:
-    own = (board == to_play).astype(np.float32)
-    opp = (board == -to_play).astype(np.float32)
-    last = np.zeros_like(own, dtype=np.float32)
-    if last_action is not None:
-        row, col = divmod(last_action, board.shape[0])
-        last[row, col] = 1.0
-    color = np.full_like(own, 1.0 if to_play == 1 else 0.0, dtype=np.float32)
-    return np.stack([own, opp, last, color], axis=0)
+    last_action_value = -1 if last_action is None else int(last_action)
+    planes = encode_feature_planes_batch(
+        boards=np.asarray(board, dtype=np.int8)[None, ...],
+        to_play=np.asarray([to_play], dtype=np.int8),
+        last_actions=np.asarray([last_action_value], dtype=np.int32),
+        board_size=board.shape[0],
+    )
+    return planes[0]
 
 
 def apply_symmetry(planes: np.ndarray, policy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -80,19 +82,21 @@ class ReplayBuffer:
         if len(self.samples) < batch_size:
             raise ValueError("not enough replay data to sample a batch")
         indices = np.random.choice(len(self.samples), size=batch_size, replace=False)
-        planes_batch = []
-        policy_batch = []
-        value_batch = []
-        for index in indices:
-            sample = self.samples[index]
-            planes = encode_sample(sample.board, sample.to_play, sample.last_action)
-            planes, policy = apply_symmetry(planes, sample.policy)
-            planes_batch.append(planes)
-            policy_batch.append(policy)
-            value_batch.append(sample.value)
-        states = torch.from_numpy(np.stack(planes_batch)).to(device, non_blocking=True)
-        policy = torch.from_numpy(np.stack(policy_batch)).to(device, non_blocking=True)
-        value = torch.tensor(value_batch, dtype=torch.float32, device=device)
+        batch = [self.samples[index] for index in indices]
+        boards = np.stack([sample.board for sample in batch], axis=0).astype(np.int8, copy=False)
+        to_play = np.fromiter((sample.to_play for sample in batch), dtype=np.int8, count=batch_size)
+        last_actions = np.fromiter(
+            ((-1 if sample.last_action is None else sample.last_action) for sample in batch),
+            dtype=np.int32,
+            count=batch_size,
+        )
+        policy_batch = np.stack([sample.policy for sample in batch], axis=0).astype(np.float32, copy=False)
+        value_batch = np.fromiter((sample.value for sample in batch), dtype=np.float32, count=batch_size)
+        planes_batch = encode_feature_planes_batch(boards, to_play, last_actions, boards.shape[-1])
+        planes_batch, policy_batch = apply_symmetry_batch(planes_batch, policy_batch)
+        states = torch.from_numpy(np.ascontiguousarray(planes_batch)).to(device, non_blocking=True)
+        policy = torch.from_numpy(np.ascontiguousarray(policy_batch)).to(device, non_blocking=True)
+        value = torch.from_numpy(value_batch).to(device, non_blocking=True)
         return states, policy, value
 
     def state_dict(self) -> dict[str, object]:

@@ -16,7 +16,10 @@ network:
 
 selfplay:
   games_per_iteration: 64
-  batch_size: 24
+  batch_size: 48
+  search_threads: 4
+  inference_batch_size: 384
+  inference_wait_ms: 1.5
   temperature_moves: 8
   dirichlet_alpha: 0.20
   dirichlet_epsilon: 0.25
@@ -54,4 +57,7 @@ arena:
 
 checkpoint:
   directory: checkpoints/rocm_unlimited
-  save_every_iteration: true
+  save_every_iteration: false
+  save_iteration_interval: 8
+  progress_interval_batches: 2
+  progress_interval_seconds: 20.0

@@ -17,6 +17,9 @@ network:
 selfplay:
   games_per_iteration: 2
   batch_size: 2
+  search_threads: 1
+  inference_batch_size: 32
+  inference_wait_ms: 0.5
   temperature_moves: 4
   dirichlet_alpha: 0.25
   dirichlet_epsilon: 0.15
@@ -46,3 +49,6 @@ arena:
 checkpoint:
   directory: checkpoints/rocm_smoke
   save_every_iteration: true
+  save_iteration_interval: 1
+  progress_interval_batches: 1
+  progress_interval_seconds: 2.0

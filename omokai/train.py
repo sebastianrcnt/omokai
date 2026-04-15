@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 import json
 import random
 import signal
 import time
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import torch
@@ -17,6 +20,7 @@ from .board import GameState
 from .checkpoint import load_checkpoint, load_training_state, save_checkpoint, save_training_state
 from .config import RunConfig, load_config
 from .device import amp_context, is_rocm_build, resolve_device
+from .evaluator import BatchedEvaluator, Evaluator, ModelEvaluator
 from .mcts import MCTS
 from .network import PolicyValueNet, clone_model
 from .openings import sample_balanced_openings
@@ -31,6 +35,33 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+@dataclass(slots=True)
+class SelfPlayChunkResult:
+    source: str
+    completed_games: list[tuple[list[PendingSample], int]]
+    black_wins: int
+    white_wins: int
+    draws: int
+    total_moves: int
+    white_to_move_games: int
+
+
+def split_evenly(items: Sequence[list[int]], parts: int) -> list[list[list[int]]]:
+    if not items:
+        return []
+    parts = max(1, min(parts, len(items)))
+    base, extra = divmod(len(items), parts)
+    chunks: list[list[list[int]]] = []
+    offset = 0
+    for index in range(parts):
+        size = base + (1 if index < extra else 0)
+        if size <= 0:
+            continue
+        chunks.append(list(items[offset : offset + size]))
+        offset += size
+    return chunks
+
+
 class Trainer:
     def __init__(self, config: RunConfig, resume_path: str | None = None) -> None:
         self.config = config
@@ -38,6 +69,7 @@ class Trainer:
         self.checkpoint_dir = config.checkpoint_dir
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = self.checkpoint_dir / "metrics.jsonl"
+        self.progress_file = self.checkpoint_dir / "runtime_progress.json"
         self.replay = ReplayBuffer(config.optimization.replay_capacity)
         self.model = PolicyValueNet(config.rules.board_size, config.network).to(self.device)
         self.best_model = clone_model(self.model).to(self.device)
@@ -60,6 +92,7 @@ class Trainer:
         }
         self.elapsed_seconds_offset = 0.0
         self.start_time = time.monotonic()
+        self.last_progress_save_time = self.start_time
         self.stop_requested = False
         signal.signal(signal.SIGINT, self._handle_stop_signal)
         signal.signal(signal.SIGTERM, self._handle_stop_signal)
@@ -242,63 +275,101 @@ class Trainer:
             return {"label": "mixed", "candidate_games": candidate_games}
         return {"label": "best", "candidate_games": 0}
 
-    def generate_selfplay(self, simulations: int, selfplay_plan: dict[str, float | int | str]) -> dict[str, float | int]:
-        searches: dict[str, MCTS] = {}
+    def _build_evaluator(self, model: PolicyValueNet) -> Evaluator:
+        if self.config.selfplay.search_threads <= 1:
+            return ModelEvaluator(model=model, device=self.device, use_amp=self.config.use_amp)
+        return BatchedEvaluator(
+            model=model,
+            device=self.device,
+            use_amp=self.config.use_amp,
+            max_batch_size=self.config.selfplay.inference_batch_size,
+            wait_ms=self.config.selfplay.inference_wait_ms,
+        )
 
-        def resolve_search(source: str) -> MCTS:
-            if source not in searches:
-                model = self.model if source == "candidate" else self.best_model
-                searches[source] = MCTS(
-                    model=model,
-                    device=self.device,
-                    c_puct=self.config.selfplay.c_puct,
-                    dirichlet_alpha=self.config.selfplay.dirichlet_alpha,
-                    dirichlet_epsilon=self.config.selfplay.dirichlet_epsilon,
-                    use_amp=self.config.use_amp,
-                )
-            return searches[source]
+    def _parallel_source_workers(self, candidate_games: int, best_games: int) -> dict[str, int]:
+        total_workers = max(1, self.config.selfplay.search_threads)
+        if total_workers <= 1:
+            return {"candidate": int(candidate_games > 0), "best": int(best_games > 0 and candidate_games == 0)}
+        if candidate_games <= 0:
+            return {"candidate": 0, "best": min(total_workers, best_games)}
+        if best_games <= 0:
+            return {"candidate": min(total_workers, candidate_games), "best": 0}
 
-        games_left = self.config.selfplay.games_per_iteration
-        candidate_games_left = int(selfplay_plan["candidate_games"])
-        best_games_left = games_left - candidate_games_left
-        openings = sample_balanced_openings(self.config.rules.board_size, games_left, self.selfplay_rng)
+        total_games = candidate_games + best_games
+        candidate_workers = max(1, min(candidate_games, round(total_workers * candidate_games / total_games)))
+        best_workers = max(1, min(best_games, total_workers - candidate_workers))
+        while candidate_workers + best_workers < total_workers:
+            if candidate_games - candidate_workers >= best_games - best_workers and candidate_workers < candidate_games:
+                candidate_workers += 1
+            elif best_workers < best_games:
+                best_workers += 1
+            else:
+                break
+        return {"candidate": candidate_workers, "best": best_workers}
+
+    def _consume_selfplay_chunk(
+        self,
+        result: SelfPlayChunkResult,
+        counters: dict[str, int | float],
+    ) -> None:
+        for history, winner in result.completed_games:
+            self.replay.add_game(history, winner)
+        counters["black_wins"] += result.black_wins
+        counters["white_wins"] += result.white_wins
+        counters["draws"] += result.draws
+        counters["total_moves"] += result.total_moves
+        counters["completed_games"] += len(result.completed_games)
+        counters["white_to_move_games"] += result.white_to_move_games
+        if result.source == "candidate":
+            counters["candidate_games"] += len(result.completed_games)
+        else:
+            counters["best_games"] += len(result.completed_games)
+
+    def _run_selfplay_chunk(
+        self,
+        source: str,
+        openings: list[list[int]],
+        simulations: int,
+        worker_batch_size: int,
+        evaluator: Evaluator,
+    ) -> SelfPlayChunkResult:
+        search = MCTS(
+            c_puct=self.config.selfplay.c_puct,
+            dirichlet_alpha=self.config.selfplay.dirichlet_alpha,
+            dirichlet_epsilon=self.config.selfplay.dirichlet_epsilon,
+            evaluator=evaluator,
+        )
+        completed_games: list[tuple[list[PendingSample], int]] = []
         black_wins = 0
         white_wins = 0
         draws = 0
         total_moves = 0
-        selfplay_candidate_games = 0
-        selfplay_best_games = 0
-        selfplay_white_to_move_games = 0
+        white_to_move_games = 0
+        pending_openings = list(openings)
 
-        while games_left > 0 and not self._should_stop():
-            if candidate_games_left > 0 and best_games_left > 0:
-                candidate_ratio = candidate_games_left / max(1, candidate_games_left + best_games_left)
-                batch_source = "candidate" if self.selfplay_rng.random() < candidate_ratio else "best"
-            elif candidate_games_left > 0:
-                batch_source = "candidate"
-            else:
-                batch_source = "best"
-
-            batch_games_left = candidate_games_left if batch_source == "candidate" else best_games_left
-            batch_size = min(self.config.selfplay.batch_size, games_left, batch_games_left)
+        while pending_openings and not self._should_stop():
+            batch_openings = pending_openings[:worker_batch_size]
+            del pending_openings[:worker_batch_size]
             states: list[GameState] = []
             histories: list[list[PendingSample]] = []
-            for _ in range(batch_size):
-                opening = openings.pop(0)
+            roots = []
+            for opening in batch_openings:
                 state = GameState(self.config.rules.board_size, self.config.rules.exactly_five)
                 for action in opening:
                     state.apply_action(action)
                 if state.to_play == -1:
-                    selfplay_white_to_move_games += 1
+                    white_to_move_games += 1
                 states.append(state)
                 histories.append([])
+                roots.append(None)
 
             while states and not self._should_stop():
                 temperatures = [1.0 if state.move_count < self.config.selfplay.temperature_moves else 0.0 for state in states]
-                results = resolve_search(batch_source).search_batch(states, simulations, temperatures, add_noise=True)
+                results = search.search_batch(states, simulations, temperatures, add_noise=True, roots=roots)
 
                 next_states: list[GameState] = []
                 next_histories: list[list[PendingSample]] = []
+                next_roots = []
                 for state, history, result in zip(states, histories, results, strict=True):
                     history.append(
                         PendingSample(
@@ -310,7 +381,7 @@ class Trainer:
                     )
                     state.apply_action(result.action)
                     if state.terminal:
-                        self.replay.add_game(history, state.winner)
+                        completed_games.append((history, state.winner))
                         total_moves += len(history)
                         if state.winner == 1:
                             black_wins += 1
@@ -321,36 +392,134 @@ class Trainer:
                     else:
                         next_states.append(state)
                         next_histories.append(history)
+                        next_roots.append(result.next_root)
                 states = next_states
                 histories = next_histories
-            games_left -= batch_size
-            if batch_source == "candidate":
-                candidate_games_left -= batch_size
-                selfplay_candidate_games += batch_size
-            else:
-                best_games_left -= batch_size
-                selfplay_best_games += batch_size
-            self.save_runtime_state(
-                {
-                    "iteration": self.iteration,
-                    "status": "selfplay_progress",
-                    "games_completed_in_iteration": self.config.selfplay.games_per_iteration - games_left,
-                    "best_iteration": self.best_iteration,
-                    "total_updates": self.total_updates,
-                }
-            )
+                roots = next_roots
 
-        total_games = black_wins + white_wins + draws
-        avg_moves = 0.0 if total_games == 0 else total_moves / total_games
+        return SelfPlayChunkResult(
+            source=source,
+            completed_games=completed_games,
+            black_wins=black_wins,
+            white_wins=white_wins,
+            draws=draws,
+            total_moves=total_moves,
+            white_to_move_games=white_to_move_games,
+        )
+
+    def _maybe_save_progress(self, games_completed: int, last_saved_games: int, metadata: dict[str, object]) -> int:
+        interval_batches = max(0, self.config.checkpoint.progress_interval_batches)
+        interval_games = interval_batches * max(1, self.config.selfplay.batch_size)
+        elapsed = time.monotonic() - self.last_progress_save_time
+        should_save = False
+        if interval_games > 0 and games_completed - last_saved_games >= interval_games:
+            should_save = True
+        if self.config.checkpoint.progress_interval_seconds > 0 and elapsed >= self.config.checkpoint.progress_interval_seconds:
+            should_save = True
+        if not should_save:
+            return last_saved_games
+        self.save_progress_state(metadata)
+        self.last_progress_save_time = time.monotonic()
+        return games_completed
+
+    def generate_selfplay(self, simulations: int, selfplay_plan: dict[str, float | int | str]) -> dict[str, float | int]:
+        total_games = self.config.selfplay.games_per_iteration
+        candidate_games = int(selfplay_plan["candidate_games"])
+        best_games = total_games - candidate_games
+        openings = sample_balanced_openings(self.config.rules.board_size, total_games, self.selfplay_rng)
+        source_openings = {
+            "candidate": openings[:candidate_games],
+            "best": openings[candidate_games:],
+        }
+        counters: dict[str, int | float] = {
+            "black_wins": 0,
+            "white_wins": 0,
+            "draws": 0,
+            "total_moves": 0,
+            "completed_games": 0,
+            "candidate_games": 0,
+            "best_games": 0,
+            "white_to_move_games": 0,
+        }
+        last_saved_games = 0
+        source_models = {"candidate": self.model, "best": self.best_model}
+        evaluators: dict[str, Evaluator] = {}
+
+        if self.config.selfplay.search_threads <= 1:
+            worker_batch_size = max(1, self.config.selfplay.batch_size)
+            try:
+                for source in ("candidate", "best"):
+                    if not source_openings[source]:
+                        continue
+                    evaluators[source] = self._build_evaluator(source_models[source])
+                    result = self._run_selfplay_chunk(source, source_openings[source], simulations, worker_batch_size, evaluators[source])
+                    self._consume_selfplay_chunk(result, counters)
+                    last_saved_games = self._maybe_save_progress(
+                        int(counters["completed_games"]),
+                        last_saved_games,
+                        {
+                            "iteration": self.iteration,
+                            "status": "selfplay_progress",
+                            "games_completed_in_iteration": int(counters["completed_games"]),
+                            "best_iteration": self.best_iteration,
+                            "total_updates": self.total_updates,
+                        },
+                    )
+            finally:
+                for evaluator in evaluators.values():
+                    evaluator.close()
+        else:
+            worker_counts = self._parallel_source_workers(candidate_games, best_games)
+            total_workers = max(1, worker_counts["candidate"] + worker_counts["best"])
+            worker_batch_size = max(1, (self.config.selfplay.batch_size + total_workers - 1) // total_workers)
+            try:
+                for source in ("candidate", "best"):
+                    if source_openings[source]:
+                        evaluators[source] = self._build_evaluator(source_models[source])
+                with ThreadPoolExecutor(max_workers=total_workers) as executor:
+                    futures = []
+                    for source in ("candidate", "best"):
+                        chunks = split_evenly(source_openings[source], worker_counts[source])
+                        for chunk in chunks:
+                            futures.append(
+                                executor.submit(
+                                    self._run_selfplay_chunk,
+                                    source,
+                                    chunk,
+                                    simulations,
+                                    worker_batch_size,
+                                    evaluators[source],
+                                )
+                            )
+                    for future in as_completed(futures):
+                        result = future.result()
+                        self._consume_selfplay_chunk(result, counters)
+                        last_saved_games = self._maybe_save_progress(
+                            int(counters["completed_games"]),
+                            last_saved_games,
+                            {
+                                "iteration": self.iteration,
+                                "status": "selfplay_progress",
+                                "games_completed_in_iteration": int(counters["completed_games"]),
+                                "best_iteration": self.best_iteration,
+                                "total_updates": self.total_updates,
+                            },
+                        )
+            finally:
+                for evaluator in evaluators.values():
+                    evaluator.close()
+
+        total_played = int(counters["black_wins"] + counters["white_wins"] + counters["draws"])
+        avg_moves = 0.0 if total_played == 0 else float(counters["total_moves"]) / total_played
         return {
-            "selfplay_games": total_games,
-            "selfplay_black_wins": black_wins,
-            "selfplay_white_wins": white_wins,
-            "selfplay_draws": draws,
+            "selfplay_games": total_played,
+            "selfplay_black_wins": int(counters["black_wins"]),
+            "selfplay_white_wins": int(counters["white_wins"]),
+            "selfplay_draws": int(counters["draws"]),
             "selfplay_avg_moves": round(avg_moves, 2),
-            "selfplay_candidate_games": selfplay_candidate_games,
-            "selfplay_best_games": selfplay_best_games,
-            "selfplay_white_to_move_games": selfplay_white_to_move_games,
+            "selfplay_candidate_games": int(counters["candidate_games"]),
+            "selfplay_best_games": int(counters["best_games"]),
+            "selfplay_white_to_move_games": int(counters["white_to_move_games"]),
             "replay_samples": len(self.replay),
             "replay_games": self.replay.games_seen,
         }
@@ -435,6 +604,9 @@ class Trainer:
             simulations=arena_simulations,
             c_puct=self.config.selfplay.c_puct,
             use_amp=self.config.use_amp,
+            search_threads=self.config.selfplay.search_threads,
+            inference_batch_size=self.config.selfplay.inference_batch_size,
+            inference_wait_ms=self.config.selfplay.inference_wait_ms,
         )
         result = arena.evaluate(arena_games)
         side_games = max(1, result.games // 2)
@@ -472,8 +644,22 @@ class Trainer:
         }
         save_checkpoint(latest_path, self.model, self.config, latest_metadata)
         save_checkpoint(best_path, self.best_model, self.config, best_metadata)
-        if self.config.checkpoint.save_every_iteration:
+        save_interval = 1 if self.config.checkpoint.save_every_iteration else max(0, self.config.checkpoint.save_iteration_interval)
+        if save_interval > 0 and self.iteration % save_interval == 0:
             save_checkpoint(self.checkpoint_dir / f"iter_{self.iteration:04d}.pt", self.model, self.config, latest_metadata)
+
+    def save_progress_state(self, metadata: dict[str, object]) -> None:
+        progress_metadata = {
+            **metadata,
+            "iteration": int(metadata.get("iteration", self.iteration)),
+            "best_iteration": int(metadata.get("best_iteration", self.best_iteration)),
+            "best_arena_win_rate": float(metadata.get("best_arena_win_rate", self.best_arena_win_rate)),
+            "total_updates": int(metadata.get("total_updates", self.total_updates)),
+            "elapsed_seconds": self.elapsed_seconds_offset + time.monotonic() - self.start_time,
+            "replay_games": self.replay.games_seen,
+            "replay_samples": len(self.replay),
+        }
+        self.progress_file.write_text(json.dumps(progress_metadata, ensure_ascii=False) + "\n", encoding="utf-8")
 
     def save_runtime_state(self, metadata: dict[str, object]) -> None:
         runtime_metadata = {
@@ -495,9 +681,12 @@ class Trainer:
             scaler_state=self.scaler.state_dict(),
             metadata=runtime_metadata,
         )
+        self.save_progress_state(runtime_metadata)
+        self.last_progress_save_time = time.monotonic()
 
     def _restore_from_checkpoint(self, resume_path: str) -> None:
         path = Path(resume_path)
+        requested_config = self.config
         replay_state = None
         trainer_extras: dict[str, object] = {}
         if path.name == "trainer_state.pt":
@@ -505,11 +694,13 @@ class Trainer:
         else:
             model, loaded_config, metadata = load_checkpoint(path, device="cpu")
 
-        self.config = loaded_config
+        self._validate_resume_config(requested_config, loaded_config)
+        self.config = requested_config
         self.device = resolve_device(self.config.device)
         self.checkpoint_dir = self.config.checkpoint_dir
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = self.checkpoint_dir / "metrics.jsonl"
+        self.progress_file = self.checkpoint_dir / "runtime_progress.json"
         self.replay = ReplayBuffer(self.config.optimization.replay_capacity)
         if replay_state:
             self.replay.load_state_dict(replay_state)
@@ -533,6 +724,7 @@ class Trainer:
         }
         self.elapsed_seconds_offset = float(metadata.get("elapsed_seconds", 0.0))
         self.start_time = time.monotonic()
+        self.last_progress_save_time = self.start_time
 
         best_model_state = trainer_extras.get("best_model_state")
         if isinstance(best_model_state, dict):
@@ -572,6 +764,12 @@ class Trainer:
                 "elapsed_hours": round(self.elapsed_hours, 4),
             }
         )
+
+    def _validate_resume_config(self, requested: RunConfig, loaded: RunConfig) -> None:
+        if requested.rules != loaded.rules:
+            raise ValueError("resume config rules do not match checkpoint rules")
+        if requested.network != loaded.network:
+            raise ValueError("resume config network does not match checkpoint network")
 
     def _move_optimizer_state_to_device(self) -> None:
         for state in self.optimizer.state.values():

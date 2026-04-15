@@ -3,11 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import numpy as np
-import torch
 
 from .board import GameState
-from .device import amp_context
-from .network import PolicyValueNet
+from .evaluator import Evaluator
 
 
 @dataclass(slots=True)
@@ -28,47 +26,67 @@ class SearchResult:
     action: int
     visit_policy: np.ndarray
     root_value: float
+    next_root: TreeNode | None = None
 
 
 class MCTS:
     def __init__(
         self,
-        model: PolicyValueNet,
-        device: torch.device,
         c_puct: float,
         dirichlet_alpha: float,
         dirichlet_epsilon: float,
-        use_amp: bool,
+        evaluator: Evaluator,
     ) -> None:
-        self.model = model
-        self.device = device
         self.c_puct = c_puct
         self.dirichlet_alpha = dirichlet_alpha
         self.dirichlet_epsilon = dirichlet_epsilon
-        self.use_amp = use_amp
+        self.evaluator = evaluator
 
-    @torch.no_grad()
     def search_batch(
         self,
         states: list[GameState],
         num_simulations: int,
         temperature: list[float],
         add_noise: bool,
+        roots: list[TreeNode | None] | None = None,
     ) -> list[SearchResult]:
-        roots = [TreeNode(to_play=state.to_play) for state in states]
-        priors, values = self._evaluate(states)
-        for idx, state in enumerate(states):
-            self._expand(roots[idx], state, priors[idx])
+        if roots is None:
+            roots = [None] * len(states)
+        if len(roots) != len(states):
+            raise ValueError("roots and states must have the same length")
+
+        active_roots = [root if root is not None else TreeNode(to_play=state.to_play) for state, root in zip(states, roots, strict=True)]
+        init_indices: list[int] = []
+        init_states: list[GameState] = []
+        root_values = np.zeros(len(states), dtype=np.float32)
+
+        for idx, (state, root) in enumerate(zip(states, active_roots, strict=True)):
+            if state.terminal:
+                continue
+            if not root.expanded:
+                init_indices.append(idx)
+                init_states.append(state)
+            elif root.visit_count > 0:
+                root_values[idx] = float(root.value())
+
+        if init_states:
+            priors, values = self._evaluate(init_states)
+            for offset, idx in enumerate(init_indices):
+                state = states[idx]
+                root = active_roots[idx]
+                self._expand(root, state, priors[offset])
+                root_values[idx] = float(values[offset])
+
+        for state, root in zip(states, active_roots, strict=True):
             if add_noise and not state.terminal:
-                self._apply_root_noise(roots[idx])
-        root_values = values.tolist()
+                self._apply_root_noise(root)
 
         for _ in range(num_simulations):
             pending_states: list[GameState] = []
             pending_nodes: list[TreeNode] = []
             pending_paths: list[list[TreeNode]] = []
 
-            for root, root_state in zip(roots, states, strict=True):
+            for root, root_state in zip(active_roots, states, strict=True):
                 if root_state.terminal:
                     continue
                 state = root_state.clone()
@@ -96,7 +114,7 @@ class MCTS:
                 self._backup(path, float(value))
 
         results: list[SearchResult] = []
-        for root, state, root_value, temp in zip(roots, states, root_values, temperature, strict=True):
+        for root, state, root_value, temp in zip(active_roots, states, root_values, temperature, strict=True):
             counts = np.zeros(state.action_size, dtype=np.float32)
             for action, child in root.children.items():
                 counts[action] = float(child.visit_count)
@@ -106,7 +124,8 @@ class MCTS:
             else:
                 counts /= counts.sum()
             action = sample_action_from_policy(counts, temp)
-            results.append(SearchResult(action=action, visit_policy=counts, root_value=float(root_value)))
+            next_root = None if state.terminal else root.children.get(action)
+            results.append(SearchResult(action=action, visit_policy=counts, root_value=float(root_value), next_root=next_root))
         return results
 
     def _select_child(self, node: TreeNode) -> tuple[int, TreeNode]:
@@ -157,13 +176,7 @@ class MCTS:
             child.prior = (1.0 - self.dirichlet_epsilon) * child.prior + self.dirichlet_epsilon * float(n)
 
     def _evaluate(self, states: list[GameState]) -> tuple[np.ndarray, np.ndarray]:
-        features = np.stack([state.feature_planes() for state in states], axis=0)
-        tensor = torch.from_numpy(features).to(self.device, non_blocking=True)
-        self.model.eval()
-        with amp_context(self.device, self.use_amp):
-            logits, values = self.model(tensor)
-        priors = torch.softmax(logits, dim=1).float().cpu().numpy()
-        return priors, values.float().cpu().numpy()
+        return self.evaluator.evaluate(states)
 
 
 def sample_action_from_policy(policy: np.ndarray, temperature: float) -> int:

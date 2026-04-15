@@ -26,6 +26,9 @@ class NetworkConfig:
 class SelfPlayConfig:
     games_per_iteration: int = 48
     batch_size: int = 12
+    search_threads: int = 1
+    inference_batch_size: int = 256
+    inference_wait_ms: float = 1.0
     temperature_moves: int = 12
     dirichlet_alpha: float = 0.20
     dirichlet_epsilon: float = 0.25
@@ -70,6 +73,9 @@ class ArenaConfig:
 class CheckpointConfig:
     directory: str = "checkpoints/default"
     save_every_iteration: bool = True
+    save_iteration_interval: int = 1
+    progress_interval_batches: int = 4
+    progress_interval_seconds: float = 30.0
 
 
 @dataclass(slots=True)

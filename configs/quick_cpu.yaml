@@ -17,6 +17,9 @@ network:
 selfplay:
   games_per_iteration: 8
   batch_size: 4
+  search_threads: 1
+  inference_batch_size: 64
+  inference_wait_ms: 0.5
   temperature_moves: 6
   dirichlet_alpha: 0.25
   dirichlet_epsilon: 0.20
@@ -46,3 +49,6 @@ arena:
 checkpoint:
   directory: checkpoints/quick_cpu
   save_every_iteration: true
+  save_iteration_interval: 1
+  progress_interval_batches: 1
+  progress_interval_seconds: 5.0
