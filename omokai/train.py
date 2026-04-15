@@ -4,6 +4,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
+import logging
 import random
 import signal
 import time
@@ -21,6 +22,7 @@ from .checkpoint import load_checkpoint, load_training_state, save_checkpoint, s
 from .config import RunConfig, load_config
 from .device import amp_context, is_rocm_build, resolve_device
 from .evaluator import BatchedEvaluator, Evaluator, ModelEvaluator
+from .logging_utils import configure_debug_logging, get_debug_logger
 from .mcts import MCTS
 from .network import PolicyValueNet, clone_model
 from .openings import sample_balanced_openings
@@ -70,6 +72,8 @@ class Trainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = self.checkpoint_dir / "metrics.jsonl"
         self.progress_file = self.checkpoint_dir / "runtime_progress.json"
+        self.debug_log_file = self.checkpoint_dir / "training.debug.log"
+        self._configure_debug_logging()
         self.replay = ReplayBuffer(config.optimization.replay_capacity)
         self.model = PolicyValueNet(config.rules.board_size, config.network).to(self.device)
         self.best_model = clone_model(self.model).to(self.device)
@@ -96,8 +100,20 @@ class Trainer:
         self.stop_requested = False
         signal.signal(signal.SIGINT, self._handle_stop_signal)
         signal.signal(signal.SIGTERM, self._handle_stop_signal)
+        self.debug_logger.debug(
+            "trainer initialized experiment=%s device=%s checkpoint_dir=%s resume_path=%s",
+            self.config.experiment_name,
+            self.device,
+            self.checkpoint_dir,
+            resume_path,
+        )
         if resume_path:
             self._restore_from_checkpoint(resume_path)
+
+    def _configure_debug_logging(self) -> None:
+        configure_debug_logging(self.debug_log_file, level=logging.DEBUG)
+        self.debug_logger = get_debug_logger("trainer")
+        self.debug_logger.debug("debug logging configured path=%s", self.debug_log_file)
 
     def _build_optimizer(self) -> torch.optim.Optimizer:
         return torch.optim.AdamW(
@@ -124,6 +140,13 @@ class Trainer:
             "best_iteration": self.best_iteration,
             "total_updates": self.total_updates,
         }
+        self.debug_logger.info(
+            "run starting iteration=%d best_iteration=%d total_updates=%d device=%s",
+            self.iteration,
+            self.best_iteration,
+            self.total_updates,
+            self.device,
+        )
         self.save_model_checkpoints(startup_metadata)
         self.save_runtime_state(startup_metadata)
 
@@ -131,9 +154,16 @@ class Trainer:
             self.iteration += 1
             simulations = self.current_simulations()
             selfplay_plan = self.current_selfplay_plan()
+            self.debug_logger.info(
+                "iteration %d started simulations=%d selfplay_plan=%s",
+                self.iteration,
+                simulations,
+                selfplay_plan,
+            )
             selfplay_stats = self.generate_selfplay(simulations, selfplay_plan)
 
             if self._should_stop():
+                self.debug_logger.warning("stop requested during selfplay at iteration=%d", self.iteration)
                 self.save_runtime_state(
                     {
                         "iteration": self.iteration,
@@ -146,6 +176,12 @@ class Trainer:
                 break
 
             if self.replay.games_seen < self.config.optimization.warmup_games:
+                self.debug_logger.info(
+                    "iteration %d warmup replay_games=%d warmup_games=%d",
+                    self.iteration,
+                    self.replay.games_seen,
+                    self.config.optimization.warmup_games,
+                )
                 warmup_metadata = {
                     "iteration": self.iteration,
                     "simulations": simulations,
@@ -170,8 +206,10 @@ class Trainer:
                 continue
 
             training_stats = self.train_model(self.model)
+            self.debug_logger.info("iteration %d training finished stats=%s", self.iteration, training_stats)
 
             if self._should_stop():
+                self.debug_logger.warning("stop requested during training at iteration=%d", self.iteration)
                 self.save_runtime_state(
                     {
                         "iteration": self.iteration,
@@ -185,11 +223,17 @@ class Trainer:
                 break
 
             arena_stats = self.evaluate_candidate(simulations)
+            self.debug_logger.info("iteration %d arena finished stats=%s", self.iteration, arena_stats)
             if arena_stats["accepted"]:
                 self.best_model.load_state_dict(self.model.state_dict())
                 self.best_model.eval()
                 self.best_iteration = self.iteration
                 self.best_arena_win_rate = float(arena_stats["arena_win_rate"])
+                self.debug_logger.info(
+                    "new best accepted iteration=%d arena_win_rate=%.4f",
+                    self.best_iteration,
+                    self.best_arena_win_rate,
+                )
                 self.best_checkpoint_metadata = {
                     "iteration": self.iteration,
                     "elapsed_hours": self.elapsed_hours,
@@ -231,6 +275,14 @@ class Trainer:
                     **training_stats,
                     **arena_stats,
                 }
+            )
+            self.debug_logger.info(
+                "iteration %d completed accepted=%s best_iteration=%d replay_games=%d replay_samples=%d",
+                self.iteration,
+                arena_stats["accepted"],
+                self.best_iteration,
+                self.replay.games_seen,
+                len(self.replay),
             )
 
     @property
@@ -277,13 +329,19 @@ class Trainer:
 
     def _build_evaluator(self, model: PolicyValueNet) -> Evaluator:
         if self.config.selfplay.search_threads <= 1:
-            return ModelEvaluator(model=model, device=self.device, use_amp=self.config.use_amp)
+            return ModelEvaluator(
+                model=model,
+                device=self.device,
+                use_amp=self.config.use_amp,
+                logger=self.debug_logger.getChild("evaluator"),
+            )
         return BatchedEvaluator(
             model=model,
             device=self.device,
             use_amp=self.config.use_amp,
             max_batch_size=self.config.selfplay.inference_batch_size,
             wait_ms=self.config.selfplay.inference_wait_ms,
+            logger=self.debug_logger.getChild("evaluator"),
         )
 
     def _parallel_source_workers(self, candidate_games: int, best_games: int) -> dict[str, int]:
@@ -305,7 +363,14 @@ class Trainer:
                 best_workers += 1
             else:
                 break
-        return {"candidate": candidate_workers, "best": best_workers}
+        workers = {"candidate": candidate_workers, "best": best_workers}
+        self.debug_logger.debug(
+            "selfplay worker split candidate_games=%d best_games=%d workers=%s",
+            candidate_games,
+            best_games,
+            workers,
+        )
+        return workers
 
     def _selfplay_temperature(self, move_count: int) -> float:
         cfg = self.config.selfplay
@@ -344,6 +409,13 @@ class Trainer:
         worker_batch_size: int,
         evaluator: Evaluator,
     ) -> SelfPlayChunkResult:
+        self.debug_logger.debug(
+            "selfplay chunk started source=%s openings=%d worker_batch_size=%d simulations=%d",
+            source,
+            len(openings),
+            worker_batch_size,
+            simulations,
+        )
         search = MCTS(
             c_puct=self.config.selfplay.c_puct,
             dirichlet_alpha=self.config.selfplay.dirichlet_alpha,
@@ -416,7 +488,7 @@ class Trainer:
                 histories = next_histories
                 roots = next_roots
 
-        return SelfPlayChunkResult(
+        result = SelfPlayChunkResult(
             source=source,
             completed_games=completed_games,
             black_wins=black_wins,
@@ -425,6 +497,16 @@ class Trainer:
             total_moves=total_moves,
             white_to_move_games=white_to_move_games,
         )
+        self.debug_logger.debug(
+            "selfplay chunk finished source=%s games=%d black_wins=%d white_wins=%d draws=%d avg_moves=%.2f",
+            source,
+            len(result.completed_games),
+            result.black_wins,
+            result.white_wins,
+            result.draws,
+            0.0 if not result.completed_games else result.total_moves / max(1, len(result.completed_games)),
+        )
+        return result
 
     def _maybe_save_progress(self, games_completed: int, last_saved_games: int, metadata: dict[str, object]) -> int:
         interval_batches = max(0, self.config.checkpoint.progress_interval_batches)
@@ -439,6 +521,11 @@ class Trainer:
             return last_saved_games
         self.save_progress_state(metadata)
         self.last_progress_save_time = time.monotonic()
+        self.debug_logger.debug(
+            "progress state saved iteration=%d games_completed=%d",
+            int(metadata.get("iteration", self.iteration)),
+            games_completed,
+        )
         return games_completed
 
     def generate_selfplay(self, simulations: int, selfplay_plan: dict[str, float | int | str]) -> dict[str, float | int]:
@@ -463,6 +550,18 @@ class Trainer:
         last_saved_games = 0
         source_models = {"candidate": self.model, "best": self.best_model}
         evaluators: dict[str, Evaluator] = {}
+        self.debug_logger.info(
+            "selfplay started iteration=%d simulations=%d total_games=%d candidate_games=%d best_games=%d search_threads=%d batch_size=%d leaves_per_batch=%d virtual_loss=%.3f",
+            self.iteration,
+            simulations,
+            total_games,
+            candidate_games,
+            best_games,
+            self.config.selfplay.search_threads,
+            self.config.selfplay.batch_size,
+            self.config.selfplay.leaves_per_batch,
+            self.config.selfplay.virtual_loss,
+        )
 
         if self.config.selfplay.search_threads <= 1:
             worker_batch_size = max(1, self.config.selfplay.batch_size)
@@ -530,6 +629,19 @@ class Trainer:
 
         total_played = int(counters["black_wins"] + counters["white_wins"] + counters["draws"])
         avg_moves = 0.0 if total_played == 0 else float(counters["total_moves"]) / total_played
+        self.debug_logger.info(
+            "selfplay finished iteration=%d games=%d candidate_games=%d best_games=%d black_wins=%d white_wins=%d draws=%d avg_moves=%.2f replay_games=%d replay_samples=%d",
+            self.iteration,
+            total_played,
+            int(counters["candidate_games"]),
+            int(counters["best_games"]),
+            int(counters["black_wins"]),
+            int(counters["white_wins"]),
+            int(counters["draws"]),
+            avg_moves,
+            self.replay.games_seen,
+            len(self.replay),
+        )
         return {
             "selfplay_games": total_played,
             "selfplay_black_wins": int(counters["black_wins"]),
@@ -553,6 +665,15 @@ class Trainer:
         policy_weight = float(self.config.optimization.policy_loss_weight)
         value_weight = float(self.config.optimization.value_loss_weight)
         recency_temperature = float(self.config.optimization.recency_temperature)
+        self.debug_logger.info(
+            "training started iteration=%d updates_per_iteration=%d batch_size=%d policy_weight=%.3f value_weight=%.3f recency_temperature=%.3f",
+            self.iteration,
+            self.config.optimization.updates_per_iteration,
+            self.config.optimization.batch_size,
+            policy_weight,
+            value_weight,
+            recency_temperature,
+        )
         for _ in range(self.config.optimization.updates_per_iteration):
             if self._should_stop():
                 break
@@ -579,6 +700,17 @@ class Trainer:
             total_policy_loss += float(policy_loss.item())
             total_value_loss += float(value_loss.item())
             updates_done += 1
+            if updates_done <= 3 or updates_done % 16 == 0:
+                self.debug_logger.debug(
+                    "training progress iteration=%d update=%d/%d loss=%.6f policy_loss=%.6f value_loss=%.6f lr=%.8f",
+                    self.iteration,
+                    updates_done,
+                    self.config.optimization.updates_per_iteration,
+                    float(loss.item()),
+                    float(policy_loss.item()),
+                    float(value_loss.item()),
+                    float(self.optimizer.param_groups[0]["lr"]),
+                )
 
         self.total_updates += updates_done
         updates = float(max(1, updates_done))
@@ -620,6 +752,15 @@ class Trainer:
             arena_accept_win_rate = self.config.arena.bootstrap_accept_win_rate
             arena_min_white_win_rate = self.config.arena.bootstrap_min_white_win_rate
             arena_simulations = max(arena_simulations, selfplay_simulations)
+        self.debug_logger.info(
+            "arena started iteration=%d phase=%s games=%d simulations=%d accept_win_rate=%.4f min_white_win_rate=%.4f",
+            self.iteration,
+            arena_phase,
+            arena_games,
+            arena_simulations,
+            arena_accept_win_rate,
+            arena_min_white_win_rate,
+        )
 
         arena = Arena(
             candidate_model=self.model,
@@ -635,6 +776,7 @@ class Trainer:
             inference_wait_ms=self.config.selfplay.inference_wait_ms,
             leaves_per_batch=self.config.selfplay.leaves_per_batch,
             virtual_loss=self.config.selfplay.virtual_loss,
+            logger=self.debug_logger.getChild("arena"),
         )
         result = arena.evaluate(arena_games)
         side_games = max(1, result.games // 2)
@@ -672,9 +814,16 @@ class Trainer:
         }
         save_checkpoint(latest_path, self.model, self.config, latest_metadata)
         save_checkpoint(best_path, self.best_model, self.config, best_metadata)
+        self.debug_logger.debug(
+            "saved model checkpoints latest=%s best=%s iteration=%d",
+            latest_path,
+            best_path,
+            self.iteration,
+        )
         save_interval = 1 if self.config.checkpoint.save_every_iteration else max(0, self.config.checkpoint.save_iteration_interval)
         if save_interval > 0 and self.iteration % save_interval == 0:
             save_checkpoint(self.checkpoint_dir / f"iter_{self.iteration:04d}.pt", self.model, self.config, latest_metadata)
+            self.debug_logger.debug("saved iteration checkpoint iteration=%d interval=%d", self.iteration, save_interval)
 
     def save_progress_state(self, metadata: dict[str, object]) -> None:
         progress_metadata = {
@@ -688,6 +837,7 @@ class Trainer:
             "replay_samples": len(self.replay),
         }
         self.progress_file.write_text(json.dumps(progress_metadata, ensure_ascii=False) + "\n", encoding="utf-8")
+        self.debug_logger.debug("wrote progress file path=%s metadata=%s", self.progress_file, progress_metadata)
 
     def save_runtime_state(self, metadata: dict[str, object]) -> None:
         runtime_metadata = {
@@ -709,6 +859,13 @@ class Trainer:
             scaler_state=self.scaler.state_dict(),
             metadata=runtime_metadata,
         )
+        self.debug_logger.debug(
+            "saved runtime state path=%s iteration=%d replay_games=%d replay_samples=%d",
+            self.checkpoint_dir / "trainer_state.pt",
+            runtime_metadata["iteration"],
+            self.replay.games_seen,
+            len(self.replay),
+        )
         self.save_progress_state(runtime_metadata)
         self.last_progress_save_time = time.monotonic()
 
@@ -729,6 +886,8 @@ class Trainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = self.checkpoint_dir / "metrics.jsonl"
         self.progress_file = self.checkpoint_dir / "runtime_progress.json"
+        self.debug_log_file = self.checkpoint_dir / "training.debug.log"
+        self._configure_debug_logging()
         self.replay = ReplayBuffer(self.config.optimization.replay_capacity)
         if replay_state:
             self.replay.load_state_dict(replay_state)
@@ -792,12 +951,22 @@ class Trainer:
                 "elapsed_hours": round(self.elapsed_hours, 4),
             }
         )
+        self.debug_logger.info(
+            "resume complete path=%s iteration=%d best_iteration=%d replay_games=%d replay_samples=%d total_updates=%d",
+            path,
+            self.iteration,
+            self.best_iteration,
+            self.replay.games_seen,
+            len(self.replay),
+            self.total_updates,
+        )
 
     def _validate_resume_config(self, requested: RunConfig, loaded: RunConfig) -> None:
         if requested.rules != loaded.rules:
             raise ValueError("resume config rules do not match checkpoint rules")
         if requested.network != loaded.network:
             raise ValueError("resume config network does not match checkpoint network")
+        self.debug_logger.debug("resume config validated against checkpoint config")
 
     def _move_optimizer_state_to_device(self) -> None:
         for state in self.optimizer.state.values():
@@ -807,6 +976,7 @@ class Trainer:
 
     def _handle_stop_signal(self, signum: int, _frame: object) -> None:
         self.stop_requested = True
+        self.debug_logger.warning("received stop signal signum=%d", signum)
         print(json.dumps({"event": "signal", "signal": signum, "message": "stop requested"}, ensure_ascii=False), flush=True)
 
     def _log(self, payload: dict[str, object]) -> None:
@@ -847,7 +1017,18 @@ def main() -> None:
         ),
         flush=True,
     )
-    trainer.run()
+    trainer.debug_logger.info(
+        "startup event emitted device=%s cuda_available=%s rocm_build=%s torch_version=%s",
+        trainer.device,
+        torch.cuda.is_available(),
+        is_rocm_build(),
+        torch.__version__,
+    )
+    try:
+        trainer.run()
+    except BaseException:
+        trainer.debug_logger.exception("training process terminated with an exception")
+        raise
 
 
 if __name__ == "__main__":

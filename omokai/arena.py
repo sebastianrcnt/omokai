@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import logging
 from typing import Sequence
 
 import torch
@@ -42,6 +43,7 @@ class Arena:
         inference_wait_ms: float = 1.0,
         leaves_per_batch: int = 1,
         virtual_loss: float = 0.0,
+        logger: logging.Logger | None = None,
     ) -> None:
         self.board_size = board_size
         self.exactly_five = exactly_five
@@ -50,12 +52,14 @@ class Arena:
         self.search_threads = max(1, search_threads)
         self.leaves_per_batch = max(1, int(leaves_per_batch))
         self.virtual_loss = max(0.0, float(virtual_loss))
+        self.logger = logger
         self.candidate_evaluator = self._build_evaluator(
             model=candidate_model,
             device=device,
             use_amp=use_amp,
             inference_batch_size=inference_batch_size,
             inference_wait_ms=inference_wait_ms,
+            logger=None if logger is None else logger.getChild("candidate_eval"),
         )
         self.best_evaluator = self._build_evaluator(
             model=best_model,
@@ -63,9 +67,19 @@ class Arena:
             use_amp=use_amp,
             inference_batch_size=inference_batch_size,
             inference_wait_ms=inference_wait_ms,
+            logger=None if logger is None else logger.getChild("best_eval"),
         )
         candidate_model.eval()
         best_model.eval()
+        if self.logger is not None:
+            self.logger.debug(
+                "arena initialized board_size=%d simulations=%d search_threads=%d leaves_per_batch=%d virtual_loss=%.3f",
+                self.board_size,
+                self.simulations,
+                self.search_threads,
+                self.leaves_per_batch,
+                self.virtual_loss,
+            )
 
     def evaluate(self, games: int) -> ArenaResult:
         target_games = max(2, games)
@@ -76,6 +90,14 @@ class Arena:
         draws = 0
         candidate_black_wins = 0
         candidate_white_wins = 0
+        if self.logger is not None:
+            self.logger.info(
+                "arena evaluation started games=%d pair_count=%d openings=%d threads=%d",
+                games,
+                pair_count,
+                len(openings),
+                self.search_threads,
+            )
 
         try:
             if self.search_threads <= 1 or len(openings) <= 1:
@@ -93,8 +115,7 @@ class Arena:
             draws += pair_draws
             candidate_black_wins += black_wins
             candidate_white_wins += white_wins
-
-        return ArenaResult(
+        result = ArenaResult(
             games=pair_count * 2,
             candidate_wins=candidate_wins,
             best_wins=best_wins,
@@ -102,6 +123,17 @@ class Arena:
             candidate_black_wins=candidate_black_wins,
             candidate_white_wins=candidate_white_wins,
         )
+        if self.logger is not None:
+            self.logger.info(
+                "arena evaluation finished games=%d candidate_wins=%d best_wins=%d draws=%d candidate_black_wins=%d candidate_white_wins=%d",
+                result.games,
+                result.candidate_wins,
+                result.best_wins,
+                result.draws,
+                result.candidate_black_wins,
+                result.candidate_white_wins,
+            )
+        return result
 
     def _build_evaluator(
         self,
@@ -110,15 +142,17 @@ class Arena:
         use_amp: bool,
         inference_batch_size: int,
         inference_wait_ms: float,
+        logger: logging.Logger | None,
     ) -> ModelEvaluator | BatchedEvaluator:
         if self.search_threads <= 1:
-            return ModelEvaluator(model=model, device=device, use_amp=use_amp)
+            return ModelEvaluator(model=model, device=device, use_amp=use_amp, logger=logger)
         return BatchedEvaluator(
             model=model,
             device=device,
             use_amp=use_amp,
             max_batch_size=inference_batch_size,
             wait_ms=inference_wait_ms,
+            logger=logger,
         )
 
     def _play_opening_pair(self, opening: Sequence[int]) -> tuple[int, int, int, int, int]:
@@ -140,6 +174,16 @@ class Arena:
                     candidate_white_wins += 1
             else:
                 best_wins += 1
+        if self.logger is not None:
+            self.logger.debug(
+                "arena opening completed opening_len=%d candidate_wins=%d best_wins=%d draws=%d black_wins=%d white_wins=%d",
+                len(opening),
+                candidate_wins,
+                best_wins,
+                draws,
+                candidate_black_wins,
+                candidate_white_wins,
+            )
         return candidate_wins, best_wins, draws, candidate_black_wins, candidate_white_wins
 
     def _play_game(self, opening: Sequence[int], candidate_color: int) -> int:
