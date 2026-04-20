@@ -20,7 +20,7 @@ from .arena import Arena
 from .board import GameState
 from .checkpoint import load_checkpoint, load_training_state, save_checkpoint, save_training_state
 from .config import RunConfig, load_config
-from .device import amp_context, is_rocm_build, resolve_device
+from .device import amp_context, is_mps_available, is_rocm_build, resolve_device
 from .evaluator import BatchedEvaluator, Evaluator, ModelEvaluator
 from .logging_utils import configure_debug_logging, get_debug_logger, log_event
 from .mcts import MCTS
@@ -1290,6 +1290,7 @@ def main() -> None:
                 "event": "startup",
                 "device": str(trainer.device),
                 "cuda_available": torch.cuda.is_available(),
+                "mps_available": is_mps_available(),
                 "rocm_build": is_rocm_build(),
                 "torch_version": torch.__version__,
             },
@@ -1301,13 +1302,15 @@ def main() -> None:
         trainer.debug_logger,
         logging.INFO,
         "startup_emitted",
-        "startup event emitted device=%s cuda_available=%s rocm_build=%s torch_version=%s",
+        "startup event emitted device=%s cuda_available=%s mps_available=%s rocm_build=%s torch_version=%s",
         trainer.device,
         torch.cuda.is_available(),
+        is_mps_available(),
         is_rocm_build(),
         torch.__version__,
         device=str(trainer.device),
         cuda_available=torch.cuda.is_available(),
+        mps_available=is_mps_available(),
         rocm_build=is_rocm_build(),
         torch_version=torch.__version__,
     )
