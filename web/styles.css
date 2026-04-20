@@ -1,0 +1,147 @@
+:root {
+  --bg: #1f1d1a;
+  --board: #d9b271;
+  --line: #2a2118;
+  --black: #111;
+  --white: #f6f1e7;
+  --accent: #e74c3c;
+  --text: #f1ede4;
+  --muted: #a39d8f;
+  --panel: #2a2723;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Apple SD Gothic Neo", sans-serif;
+  min-height: 100vh;
+}
+
+main {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+}
+
+header h1 {
+  margin: 0 0 4px;
+  font-size: 28px;
+  letter-spacing: 0.02em;
+}
+
+.subtitle {
+  margin: 0 0 20px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  background: var(--panel);
+  padding: 12px 16px;
+  border-radius: 8px;
+  margin-bottom: 20px;
+}
+
+.controls label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.controls select,
+.controls input[type="range"] {
+  background: #1a1815;
+  color: var(--text);
+  border: 1px solid #3a342c;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 14px;
+  min-width: 160px;
+}
+
+.controls input[type="range"] {
+  padding: 0;
+  min-width: 180px;
+}
+
+.controls button {
+  background: var(--accent);
+  color: white;
+  border: none;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 14px;
+  cursor: pointer;
+  align-self: flex-end;
+}
+
+.controls button:hover { background: #c0392b; }
+.controls button:disabled { background: #555; cursor: not-allowed; }
+
+#sims-value {
+  display: inline-block;
+  margin-left: 6px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.game {
+  display: grid;
+  grid-template-columns: minmax(0, auto) 1fr;
+  gap: 20px;
+}
+
+@media (max-width: 760px) {
+  .game { grid-template-columns: 1fr; }
+}
+
+#board {
+  display: block;
+  background: var(--board);
+  border-radius: 8px;
+  cursor: pointer;
+  max-width: 100%;
+  height: auto;
+}
+
+.status {
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 16px;
+  font-size: 14px;
+}
+
+#status-line {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+
+.meta {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+
+.meta span { color: var(--text); }
+
+details summary { cursor: pointer; color: var(--muted); }
+pre {
+  background: #1a1815;
+  padding: 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  max-height: 240px;
+  overflow: auto;
+  margin: 8px 0 0;
+}
